@@ -1,0 +1,736 @@
+#!/bin/bash
+#
+# lvm-duplicity - backup logical volumes using duplicity
+#
+# Copyright (C) 2011 Claudio Jolowicz <cj@dealloc.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111 USA.
+
+prog=$(basename $0)
+VERSION=0.1
+confdir=/etc
+pkgdatadir=/var/lib/$prog
+
+##
+# Print the version.
+#
+version () {
+    echo "\
+$prog version $VERSION
+Copyright (C) 2011 Claudio Jolowicz <cj@dealloc.org>
+
+Backup logical volumes using duplicity.
+
+$prog comes with ABSOLUTELY NO WARRANTY.  This is free software, and you
+are welcome to redistribute it under certain conditions.  See the GNU
+General Public Licence for details.
+"
+}
+
+##
+# Print the usage.
+#
+usage () {
+    version
+    echo "\
+Usage: $prog [option].. [volume-group | logical-volume]..
+       $prog [option].. --all
+
+Options:
+
+    -a, --all                    backup all volume groups
+    --backup-scheme SCHEME       scheme for the backup server
+    --backup-host HOST           hostname for the backup server
+    --backup-port PORT           port for the backup server
+    --backup-user USER           username for the backup server
+    --backup-password PASSWORD   password for the backup server
+    --backup-dir DIR             directory on the backup server
+    --lvm-snapshot-size-min N    minimum size of LVM snapshot
+    --lvm-snapshot-size-max N    maximum size of LVM snapshot
+    --lvm-snapshot-size-ratio N  original volume size / LVM snapshot size
+    -n, --dry-run                print commands without executing them
+    -V, --version                print version number
+    -h, --help                   display this message
+
+duplicity commands:
+
+    --full                     create the backup archive for an LVM snapshot
+    --incremental              update the backup archive from an LVM snapshot
+    --restore FILE             restore the backup archive to the given directory
+    --verify                   compare the backup archive to the current files
+    --collection-status        summarize the status of the backup archive
+    --list-current-files       list the files in the backup archive
+    --cleanup                  delete extraneous files in the backup archive
+    --remove-older-than TIME   delete archives older than the given time
+    --remove-all-but-n-full N  delete archives older than Nth last full backup
+
+duplicity options:
+
+    --force                 proceed even if data loss might result
+    --verbosity LEVEL       verbosity level from 0 to 9 (default: 3)
+    --encrypt-key KEY       key used to encrypt and decrypt the backup volumes
+    --sign-key KEY          key used to sign and verify the backup volumes
+    --scp-command COMMAND   command used to send or receive files
+
+The program reads $confdir/$prog.conf if it exists.
+Each line in this file may contain a long option without the leading
+hyphens. Option must be separated from their arguments by an \`='
+without whitespace. Empty lines and lines starting with a \`#' are ignored.
+"
+}
+
+##
+# Print an error message and exit.
+#
+fatal() {
+    echo "$prog: $*" >&2
+    exit 1
+}
+
+##
+# Print a warning.
+#
+warning() {
+    echo "$prog: $*" >&2
+}
+
+##
+# Usage error: invalid option
+#
+bad_option () {
+    echo "$prog: unrecognized option \`$1'" >&2
+    echo "Try \`$prog --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: missing argument
+#
+missing_argument () {
+    echo "$prog: option \`$1' requires an argument" >&2
+    echo "Try \`$prog --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: invalid argument
+#
+bad_argument () {
+    echo "$prog: invalid argument for option \`$1': \`$2'" >&2
+    echo "Try \`$prog --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: invalid parameter
+#
+bad_parameter () {
+    echo "$prog: unrecognized parameter \`$1'" >&2
+    echo "Try \`$prog --help' for more information." >&2
+    exit 1
+}
+
+##
+# Usage error: missing parameter
+#
+missing_parameter () {
+    echo "$prog: missing required parameter: $1" >&2
+    echo "Try \`$prog --help' for more information." >&2
+    exit 1
+}
+
+##
+# Check if the argument is numerical.
+#
+is_numerical () {
+    if echo "$1" | grep -q '[^0-9]' ; then
+        return 1
+    fi
+
+    return 0
+}
+
+##
+# Evaluate a size specification.
+#
+evaluate_size_specification () {
+    if ! is_numerical "${1%?}" ; then
+        return 1
+    fi
+
+    case $1 in
+        *E) echo $((${1%?} * 1000 * 1000 * 1000 * 1000 * 1000 * 1000)) ;;
+        *P) echo $((${1%?} * 1000 * 1000 * 1000 * 1000 * 1000)) ;;
+        *T) echo $((${1%?} * 1000 * 1000 * 1000 * 1000)) ;;
+        *G) echo $((${1%?} * 1000 * 1000 * 1000)) ;;
+        *M) echo $((${1%?} * 1000 * 1000)) ;;
+        *K) echo $((${1%?} * 1000)) ;;
+        *B) echo ${1%?} ;;
+        *e) echo $((${1%?} * 1024 * 1024 * 1024 * 1024 * 1024 * 1024)) ;;
+        *p) echo $((${1%?} * 1024 * 1024 * 1024 * 1024 * 1024)) ;;
+        *t) echo $((${1%?} * 1024 * 1024 * 1024 * 1024)) ;;
+        *g) echo $((${1%?} * 1024 * 1024 * 1024)) ;;
+        *m) echo $((${1%?} * 1024 * 1024)) ;;
+        *k) echo $((${1%?} * 1024)) ;;
+        *b) echo ${1%?} ;;
+        *)  echo $1 ;;
+    esac
+}
+
+##
+# Parse a configuration file.
+#
+parse_configuration_file () {
+    printf 'configuration_options=()\n'
+    sed '/^[ \t]*\(#\|$\)/d' "$1" |
+    while read line ; do
+        case $line in
+            *'=yes')
+                printf 'configuration_options+=(--%q)\n' \
+                    "${line%%=*}"
+                ;;
+
+            *'=no')
+                printf 'configuration_options+=(--no-%q)\n' \
+                    "${line%%=*}"
+                ;;
+
+            *'='*)
+                printf 'configuration_options+=(--%q %q)\n' \
+                    "${line%%=*}" \
+                    "${line#*=}"
+                ;;
+
+            *)
+                printf 'configuration_options+=(--%q)\n' \
+                    "${line}"
+                ;;
+        esac
+    done
+}
+
+if [ -f $confdir/$prog.conf ] ; then
+    eval "$(parse_configuration_file "$confdir/$prog.conf")" || \
+        fatal "cannot read \`$confdir/$prog.conf'"
+    set -- "${configuration_options[@]}" "$@"
+fi
+
+##
+# Parse the command line.
+#
+dry_run=no
+all=no
+backup_scheme=
+backup_host=
+backup_port=
+backup_user=
+backup_password=
+backup_dir=
+lvm_snapshot_size_min=0
+lvm_snapshot_size_max=0
+lvm_snapshot_size_ratio=1
+duplicity_command=
+duplicity_restore_basedir=
+duplicity_remove_older_than=
+duplicity_remove_all_but_n_full=
+duplicity_options=()
+verbosity=3
+while [ $# -gt 0 ] ; do
+    option=$1
+    shift
+
+    case $option in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+
+        -V | --version)
+            version
+            exit 0
+            ;;
+
+        -n | --dry-run)
+            dry_run=yes
+            ;;
+
+        -a | --all)
+            all=yes
+            ;;
+
+        --backup-scheme)
+            [ $# -gt 0 ] || missing_argument $option
+            backup_scheme="$1"
+            shift
+            ;;
+
+        --backup-host)
+            [ $# -gt 0 ] || missing_argument $option
+            backup_host="$1"
+            shift
+            ;;
+
+        --backup-port)
+            [ $# -gt 0 ] || missing_argument $option
+            backup_port="$1"
+            shift
+            ;;
+
+        --backup-user)
+            [ $# -gt 0 ] || missing_argument $option
+            backup_user="$1"
+            shift
+            ;;
+
+        --backup-password)
+            [ $# -gt 0 ] || missing_argument $option
+            backup_password="$1"
+            shift
+            ;;
+
+        --backup-dir)
+            [ $# -gt 0 ] || missing_argument $option
+            backup_dir="$1"
+            shift
+            ;;
+
+        --lvm-snapshot-size-min)
+            [ $# -gt 0 ] || missing_argument $option
+            lvm_snapshot_size_min=$(evaluate_size_specification "$1") || \
+                bad_argument $option "$1"
+            shift
+            ;;
+
+        --lvm-snapshot-size-max)
+            [ $# -gt 0 ] || missing_argument $option
+            lvm_snapshot_size_max=$(evaluate_size_specification "$1") || \
+                bad_argument $option "$1"
+            shift
+            ;;
+
+        --lvm-snapshot-size-ratio)
+            [ $# -gt 0 ] || missing_argument $option
+            is_numerical "$1" || bad_argument $option "$1"
+            lvm_snapshot_size_ratio="$1"
+            shift
+            ;;
+
+        --full)
+            duplicity_command=full
+            ;;
+
+        --incremental)
+            duplicity_command=incremental
+            ;;
+
+        --restore)
+            [ $# -gt 0 ] || missing_argument $option
+            duplicity_command=restore
+            duplicity_restore_basedir="$1"
+            shift
+            ;;
+
+        --verify)
+            duplicity_command=verify
+            ;;
+
+        --collection-status)
+            duplicity_command=collection-status
+            ;;
+
+        --list-current-files)
+            duplicity_command=list-current-files
+            ;;
+
+        --cleanup)
+            duplicity_command=cleanup
+            ;;
+
+        --remove-older-than)
+            duplicity_command=remove-older-than
+            [ $# -gt 0 ] || missing_argument $option
+            duplicity_remove_older_than="$1"
+            shift
+            ;;
+
+        --remove-all-but-n-full)
+            duplicity_command=remove-all-but-n-full
+            [ $# -gt 0 ] || missing_argument $option
+            duplicity_remove_all_but_n_full="$1"
+            shift
+            ;;
+
+        --force)
+            duplicity_options+=(--force)
+            ;;
+
+        --verbosity)
+            [ $# -gt 0 ] || missing_argument $option
+            is_numerical "$1" || bad_argument $option "$1"
+            duplicity_options+=(--verbosity "$1")
+            verbosity="$1"
+            shift
+            ;;
+
+        --encrypt-key)
+            [ $# -gt 0 ] || missing_argument $option
+            duplicity_options+=(--encrypt-key "$1")
+            shift
+            ;;
+
+        --sign-key)
+            [ $# -gt 0 ] || missing_argument $option
+            duplicity_options+=(--sign-key "$1")
+            shift
+            ;;
+
+        --scp-command)
+            [ $# -gt 0 ] || missing_argument $option
+            duplicity_options+=(--scp-command "$1")
+            shift
+            ;;
+
+        --) break ;;
+        -*) bad_option $option ;;
+        *) set -- "$option" "$@" ; break ;;
+    esac
+done
+
+if [ $# -eq 0 -a $all = no ] ; then
+    usage
+    exit 0
+fi
+
+if [ $# -gt 0 -a $all = yes ] ; then
+    bad_argument --all "$1"
+fi
+
+if [ $dry_run = yes ] ; then
+    run=echo
+fi
+
+if [ -n "$backup_host" ] ; then
+    : ${backup_scheme:=scp}
+else
+    : ${backup_scheme:=file}
+fi
+
+##
+# List volume groups.
+#
+list_volume_groups () {
+    if [ $dry_run = yes ] ; then
+        echo "vgs --noheadings --options=vg_name" >&2
+    fi
+
+    vgs --noheadings --options=vg_name | awk '
+{
+    print "/dev/" $1
+}'
+}
+
+##
+# List logical volumes.
+#
+list_logical_volumes () {
+    if [ $dry_run = yes ] ; then
+        echo "lvs --noheadings --options=vg_name,lv_name \"$1\"" >&2
+    fi
+
+    lvs --noheadings --options=vg_name,lv_name "$1" | awk '
+{
+    print "/dev/" $1 "/" $2
+}'
+}
+
+##
+# Lookup a volume group.
+#
+lookup_volume_group () {
+    if [ $dry_run = yes ] ; then
+        echo "vgs --noheadings --options=vg_name \"$1\"" >&2
+    fi
+
+    vgs --noheadings --options=vg_name "$1" | awk '
+BEGIN {
+    print "vg_name="
+}
+{
+    print "vg_name=\"" $1 "\""
+    exit
+}'
+}
+
+##
+# Lookup a logical volume.
+#
+lookup_logical_volume () {
+    if [ $dry_run = yes ] ; then
+        echo "\
+lvs --noheadings --units=b --options=vg_name,lv_name,lv_size,vg_free \"$1\"" >&2
+    fi
+
+    lvs --noheadings --units=b --options=vg_name,lv_name,lv_size,vg_free "$1" |
+    awk '
+BEGIN {
+    print "vg_name="
+    print "lv_name="
+    print "lv_size="
+    print "vg_free="
+}
+{
+    print "vg_name=\"" $1 "\""
+    print "lv_name=\"" $2 "\""
+    print "lv_size=\"" $3 "\""
+    print "vg_free=\"" $4 "\""
+    exit
+}'
+}
+
+##
+# Lookup an fstab entry.
+#
+lookup_fstab_entry () {
+    sed '/^#/d' /etc/fstab | awk '
+BEGIN {
+    print "fs_spec="
+    print "fs_file="
+    print "fs_vfstype="
+    print "fs_mntops="
+}
+($1 == "'"$1"'") {
+    print "fs_spec=\"" $1 "\""
+    print "fs_file=\"" $2 "\""
+    print "fs_vfstype=\"" $3 "\""
+    print "fs_mntops=\"" $4 "\""
+    exit
+}'
+}
+
+#
+## expand volume group names
+#
+files=()
+if [ $# -eq 0 -a $all = yes ] ; then
+    for vg_name in $(list_volume_groups) ; do
+        files+=($(list_logical_volumes "$vg_name"))
+    done
+else
+    for file ; do
+        eval "$(lookup_volume_group "$file" 2>/dev/null)"
+
+        if [ -n "$vg_name" ] ; then
+            files+=($(list_logical_volumes "$vg_name"))
+        else
+            files+=("$file")
+        fi
+    done
+fi
+
+#
+## main program
+#
+status=0
+
+duplicity_base_url="${backup_scheme}://\
+${backup_user}${backup_password:+:}\
+${backup_password}${backup_user:+@}\
+${backup_host}${backup_port:+:}\
+${backup_port}${backup_dir:+/}\
+${backup_dir}"
+
+for file in "${files[@]}" ; do
+    if [ ${#files[@]} -gt 1 -a $verbosity -gt 3 ] ; then
+        echo "==> $file <=="
+    fi
+
+    #
+    ## retrieve volume information
+    #
+    eval "$(lookup_logical_volume "$file")"
+
+    if [ -z "$vg_name" -o -z "$lv_name" -o -z "$lv_size" ] ; then
+        warning "\`$file' does not appear to be a logical volume"
+        status=1
+        continue
+    fi
+
+    lv_file="/dev/mapper/${vg_name}-${lv_name}"
+    lv_link="/dev/${vg_name}/${lv_name}"
+    lv_size=${lv_size%B}
+    vg_free=${vg_free%B}
+
+    #
+    ## retrieve fstab information
+    #
+    eval "$(lookup_fstab_entry "$lv_file")"
+
+    if [ -z "$fs_spec" -o -z "$fs_file" -o -z "$fs_vfstype" -o \
+         -z "$fs_mntops" ] ; then
+        eval "$(lookup_fstab_entry "$lv_link")"
+    fi
+
+    if [ -z "$fs_spec" -o -z "$fs_file" -o -z "$fs_vfstype" -o \
+         -z "$fs_mntops" ] ; then
+        if [ $all = no ] ; then
+            warning "\`$lv_link' does not appear in /etc/fstab"
+            status=1
+        fi
+        continue
+    fi
+
+    if [ "$fs_vfstype" = swap ] ; then
+        if [ $all = no ] ; then
+            warning "\`$lv_link' is used as a swap device"
+            status=1
+        fi
+        continue
+    fi
+
+    #
+    ## invoke duplicity
+    #
+    duplicity_url="${duplicity_base_url%/}/${vg_name}-${lv_name}"
+
+    case $duplicity_command in
+        full | incremental | '')
+            lv_snapshot_name="${lv_name}-snapshot"
+            lv_snapshot_link="${lv_link}-snapshot"
+            lv_snapshot_file="${lv_file}-snapshot"
+
+            lv_snapshot_dir="${pkgdatadir}/${vg_name}-${lv_name}"
+
+            if [ ! -d "$lv_snapshot_dir" ] ; then
+                if ! $run mkdir -p "$lv_snapshot_dir" ; then
+		    warning "\
+cannot create mountpoint for snapshot of \`$lv_link'"
+		    status=1
+		    continue
+                fi
+            fi
+
+            lv_snapshot_size=$(($lv_size / $lvm_snapshot_size_ratio))
+
+            if [ $lv_snapshot_size -lt $lvm_snapshot_size_min ] ; then
+                lv_snapshot_size=$lvm_snapshot_size_min
+            fi
+
+            if [ $lvm_snapshot_size_max -gt 0 -a \
+                 $lv_snapshot_size -gt $lvm_snapshot_size_max ] ; then
+                lv_snapshot_size=$lvm_snapshot_size_max
+            fi
+
+            if [ $lv_snapshot_size -gt $vg_free ] ; then
+                lv_snapshot_size=$vg_free
+            fi
+
+            lv_snapshot_size_k=$(($lv_snapshot_size / 1024))k
+
+            if ! $run lvcreate --size=${lv_snapshot_size_k} --snapshot \
+                               --name "$lv_snapshot_name" \
+                               "$lv_link" ; then
+                warning "cannot create a snapshot of \`$lv_link'"
+                status=1
+                continue
+            fi
+
+            if ! $run mount -t "$fs_vfstype" -o "$fs_mntops" \
+                      "$lv_snapshot_link" \
+                      "$lv_snapshot_dir" ; then
+                warning "cannot mount snapshot of \`$lv_link'"
+                if ! $run lvremove --force "$lv_snapshot_link" ; then
+                    warning "cannot remove snapshot of \`$lv_link'"
+                fi
+                status=1
+                continue
+            fi
+
+            if ! $run duplicity $duplicity_command \
+                                "${duplicity_options[@]}" \
+                                "$lv_snapshot_dir" \
+                                "$duplicity_url" ; then
+                status=$?
+                warning "\
+cannot create ${duplicity_command}${duplicity_command:+ }backup of \`$lv_link'"
+            fi
+
+            if ! $run umount "$lv_snapshot_dir" ; then
+                warning "cannot unmount snapshot of \`$lv_link'"
+                status=1
+            fi
+
+            if ! $run lvremove --force "$lv_snapshot_link" ; then
+                warning "cannot remove snapshot of \`$lv_link'"
+                status=1
+            fi
+            ;;
+
+        restore)
+            duplicity_restore_dir="\
+${duplicity_restore_basedir%/}/${vg_name}-${lv_name}"
+            if [ ! -d "$duplicity_restore_dir" ] ; then
+                if ! $run mkdir -p "$duplicity_restore_dir" ; then
+		    warning "\
+cannot create directory to restore archive of \`$lv_link'"
+		    status=1
+		    continue
+                fi
+            fi
+
+            $run duplicity $duplicity_command \
+                           "${duplicity_options[@]}" \
+                           "$duplicity_url" \
+                           "$duplicity_restore_dir" || \
+                status=$?
+            ;;
+
+        verify)
+            $run duplicity $duplicity_command \
+                           "${duplicity_options[@]}" \
+                           "$duplicity_url" \
+                           "$fs_file" || \
+                status=$?
+            ;;
+
+        collection-status | list-current-files | cleanup)
+            $run duplicity $duplicity_command \
+                           "${duplicity_options[@]}" \
+                           "$duplicity_url" || \
+                status=$?
+            ;;
+
+        remove-older-than)
+            $run duplicity $duplicity_command \
+                           "$duplicity_remove_older_than" \
+                           "${duplicity_options[@]}" \
+                           "$duplicity_url" || \
+                status=$?
+            ;;
+
+        remove-all-but-n-full)
+            $run duplicity $duplicity_command \
+                           "$duplicity_remove_all_but_n_full" \
+                           "${duplicity_options[@]}" \
+                           "$duplicity_url" || \
+                status=$?
+            ;;
+    esac
+
+    if [ ${#files[@]} -gt 1 -a $verbosity -gt 3 ] ; then
+        echo
+    fi
+done
+
+exit $status
